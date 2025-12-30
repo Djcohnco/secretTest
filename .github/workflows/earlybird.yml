@@ -1,0 +1,47 @@
+name: EarlyBird Secret Scan (non-blocking)
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  earlybird:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build EarlyBird
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird
+          cd /tmp/earlybird
+          go build -o /tmp/earlybird .
+
+      # Run scan, but NEVER fail the job.
+      - name: Run EarlyBird scan (non-blocking)
+        id: scan
+        run: |
+          set +e
+          /tmp/earlybird --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
+          exit 0
+
+      - name: Upload scan output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: earlybird-output
+          path: earlybird-output.txt
