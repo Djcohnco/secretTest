@@ -29,33 +29,28 @@ jobs:
           go-version: "1.22"
           cache: true
 
-      - name: Build EarlyBird
+      - name: Fetch + build EarlyBird
         run: |
           set -euo pipefail
           git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird-src
           cd /tmp/earlybird-src
-          go build -o /tmp/earlybird-bin .
+          go build -o /tmp/go-earlybird .
+          /tmp/go-earlybird --help >/dev/null
 
-      - name: Prepare EarlyBird config
+      - name: Install EarlyBird config (no sudo)
         run: |
           set -euo pipefail
           mkdir -p ~/.go-earlybird
-          cat << 'EOF' > ~/.go-earlybird/earlybird.json
-          {
-            "confidence": 0.6,
-            "confidenceThreshold": 0.6,
-            "entropy": true,
-            "entropyThreshold": 3.5,
-            "maxFileSize": 5242880,
-            "allowlist": [],
-            "exclude": []
-          }
-          EOF
+          # Copy the shipped configuration bundle that EarlyBird expects
+          cp -R /tmp/earlybird-src/config/* ~/.go-earlybird/
+
+          echo "Contents of ~/.go-earlybird:"
+          ls -la ~/.go-earlybird
 
       - name: Run EarlyBird scan (non-blocking)
         run: |
           set +e
-          /tmp/earlybird-bin --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
+          /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
           exit 0
 
       - name: Upload scan output artifact
