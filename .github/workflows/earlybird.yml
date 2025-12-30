@@ -1,7 +1,7 @@
 name: EarlyBird -> GitHub Code Scanning (non-blocking)
 
 "on":
-  pull_request: {}
+  pull_request_target: {}
   push:
     branches:
       - main
@@ -12,14 +12,14 @@ name: EarlyBird -> GitHub Code Scanning (non-blocking)
 
 permissions:
   contents: read
-  security-events: write # required to upload SARIF
+  security-events: write
 
 jobs:
   earlybird:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repo (base branch)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -46,15 +46,14 @@ jobs:
       - name: Run EarlyBird scan (non-blocking)
         run: |
           set +e
-          # If you don't have a .ge_ignore in the repo yet, remove the --ignorefile flag.
           /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" --ignorefile "${GITHUB_WORKSPACE}/.ge_ignore" 2>&1 | tee earlybird-output.txt
           exit 0
 
-      - name: Convert EarlyBird output -> SARIF
+      - name: Convert EarlyBird output -> SARIF (no fingerprints)
         run: |
           set -euo pipefail
           python3 - << 'PY'
-          import json, os, re, hashlib
+          import json, os, re
           from datetime import datetime, timezone
 
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
@@ -136,24 +135,16 @@ jobs:
                       },
                   }
 
-              message = f"{caption} | Value: {value}"
-
-              fp_src = f"{rule_id}|{file_rel}|{line}|{value}"
-              fingerprint = hashlib.sha256(fp_src.encode("utf-8")).hexdigest()
-
               results.append({
                   "ruleId": rule_id,
                   "level": sarif_level(sev),
-                  "message": {"text": message},
+                  "message": {"text": f"{caption} | Value: {value}"},
                   "locations": [{
                       "physicalLocation": {
                           "artifactLocation": {"uri": file_rel},
                           "region": {"startLine": line}
                       }
-                  }],
-                  "partialFingerprints": {
-                      "primaryLocationLineHash": fingerprint
-                  }
+                  }]
               })
 
           sarif = {
@@ -178,7 +169,7 @@ jobs:
           with open(out_path, "w", encoding="utf-8") as f:
               json.dump(sarif, f, indent=2)
 
-          print(f"Wrote {out_path} with {len(results)} result(s) and {len(rules)} rule(s).")
+          print(f"Wrote {out_path} with {len(results)} result(s).")
           PY
 
       - name: Upload SARIF to GitHub Code Scanning
@@ -186,9 +177,3 @@ jobs:
         with:
           sarif_file: earlybird.sarif
           category: earlybird
-
-      - name: Upload raw EarlyBird output artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: earlybird-output
-          path: earlybird-output.txt
