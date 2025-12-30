@@ -1,4 +1,4 @@
-name: EarlyBird Secret Scan (non-blocking)
+name: EarlyBird -> GitHub Code Scanning (non-blocking)
 
 "on":
   pull_request: {}
@@ -12,6 +12,7 @@ name: EarlyBird Secret Scan (non-blocking)
 
 permissions:
   contents: read
+  security-events: write # required to upload SARIF to code scanning
 
 jobs:
   earlybird:
@@ -35,26 +36,151 @@ jobs:
           git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird-src
           cd /tmp/earlybird-src
           go build -o /tmp/go-earlybird .
-          /tmp/go-earlybird --help >/dev/null
 
       - name: Install EarlyBird config (no sudo)
         run: |
           set -euo pipefail
           mkdir -p ~/.go-earlybird
-          # Copy the shipped configuration bundle that EarlyBird expects
           cp -R /tmp/earlybird-src/config/* ~/.go-earlybird/
-
-          echo "Contents of ~/.go-earlybird:"
-          ls -la ~/.go-earlybird
 
       - name: Run EarlyBird scan (non-blocking)
         run: |
           set +e
-          /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
+          /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" --ignorefile "${GITHUB_WORKSPACE}/.ge_ignore" 2>&1 | tee earlybird-output.txt
           exit 0
 
-      - name: Upload scan output artifact
-        uses: actions/upload-artifact@v4
+      - name: Convert EarlyBird output -> SARIF
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import json, os, re, hashlib
+          from datetime import datetime, timezone
+
+          root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+          in_path = os.path.join(root, "earlybird-output.txt")
+          out_path = os.path.join(root, "earlybird.sarif")
+
+          text = open(in_path, "r", encoding="utf-8", errors="replace").read()
+
+          # Parse blocks like:
+          # Finding # 1:
+          #   Code #: 3019
+          #   Filename: /path/to/file
+          #   Caption: ...
+          #   Category: ...
+          #   Line #: 35
+          #   Value: ...
+          #   Severity: low
+          #   Confidence: high
+          finding_re = re.compile(
+              r"Finding\s*#\s*(?P<num>\d+):\s*\n"
+              r"(?:.*?\n)*?"
+              r"\s*Code\s*#:\s*(?P<code>\d+)\s*\n"
+              r"\s*Filename:\s*(?P<file>.+?)\s*\n"
+              r"\s*Caption:\s*(?P<caption>.+?)\s*\n"
+              r"\s*Category:\s*(?P<category>.+?)\s*\n"
+              r"\s*Line\s*#:\s*(?P<line>\d+)\s*\n"
+              r"\s*Value:\s*(?P<value>.+?)\s*\n"
+              r"\s*Severity:\s*(?P<severity>\w+)\s*\n"
+              r"\s*Confidence:\s*(?P<confidence>\w+)\s*\n",
+              re.MULTILINE
+          )
+
+          def rel_path(p):
+              p = p.strip()
+              try:
+                  if p.startswith(root):
+                      rp = os.path.relpath(p, root)
+                      return rp
+              except Exception:
+                  pass
+              return p
+
+          def sarif_level(sev):
+              sev = (sev or "").lower()
+              # Map EarlyBird severity -> SARIF level (loosely)
+              if sev in ("high", "critical"):
+                  return "error"
+              if sev in ("medium",):
+                  return "warning"
+              return "note"
+
+          rules = {}
+          results = []
+
+          for m in finding_re.finditer(text):
+              code = m.group("code").strip()
+              caption = m.group("caption").strip()
+              category = m.group("category").strip()
+              value = m.group("value").strip()
+              sev = m.group("severity").strip()
+              conf = m.group("confidence").strip()
+              line = int(m.group("line").strip())
+              file_abs = m.group("file").strip()
+              file_rel = rel_path(file_abs)
+
+              rule_id = f"EB-{code}"
+              if rule_id not in rules:
+                  rules[rule_id] = {
+                      "id": rule_id,
+                      "name": rule_id,
+                      "shortDescription": {"text": caption},
+                      "fullDescription": {"text": f"{caption} (category={category}, confidence={conf})"},
+                      "properties": {
+                          "tags": ["earlybird", category, conf, sev],
+                          "precision": conf.lower(),
+                          "severity": sev.lower(),
+                      },
+                  }
+
+              message = f"{caption} | Value: {value}"
+
+              # Fingerprint helps GitHub track the same alert across runs
+              fp_src = f"{rule_id}|{file_rel}|{line}|{value}"
+              fingerprint = hashlib.sha256(fp_src.encode("utf-8")).hexdigest()
+
+              results.append({
+                  "ruleId": rule_id,
+                  "level": sarif_level(sev),
+                  "message": {"text": message},
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": file_rel},
+                          "region": {"startLine": line}
+                      }
+                  }],
+                  "partialFingerprints": {
+                      "primaryLocationLineHash": fingerprint
+                  }
+              })
+
+          sarif = {
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "EarlyBird",
+                          "informationUri": "https://github.com/americanexpress/earlybird",
+                          "rules": list(rules.values())
+                      }
+                  },
+                  "invocations": [{
+                      "executionSuccessful": True,
+                      "endTimeUtc": datetime.now(timezone.utc).isoformat()
+                  }],
+                  "results": results
+              }]
+          }
+
+          with open(out_path, "w", encoding="utf-8") as f:
+              json.dump(sarif, f, indent=2)
+
+          print(f"Wrote {out_path} with {len(results)} result(s) and {len(rules)} rule(s).")
+          PY
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          name: earlybird-output
-          path: earlybird-output.txt
+          sarif_file: earlybird.sarif
+          category: earlybird
