@@ -28,16 +28,14 @@ jobs:
       - name: Build EarlyBird
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird
-          cd /tmp/earlybird
-          go build -o /tmp/earlybird .
+          git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird-src
+          cd /tmp/earlybird-src
+          go build -o /tmp/earlybird-bin .
 
-      # Run scan, but NEVER fail the job.
       - name: Run EarlyBird scan (non-blocking)
-        id: scan
         run: |
           set +e
-          /tmp/earlybird --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
+          /tmp/earlybird-bin --path "${GITHUB_WORKSPACE}" 2>&1 | tee earlybird-output.txt
           exit 0
 
       - name: Upload scan output artifact
