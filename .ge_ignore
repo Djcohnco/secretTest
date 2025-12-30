@@ -1,0 +1,85 @@
+# -------------------------
+# Dependency / build junk
+# -------------------------
+node_modules/
+vendor/
+dist/
+build/
+out/
+coverage/
+.cache/
+.gradle/
+.m2/
+target/
+bin/
+obj/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# -------------------------
+# Package manager locks
+# -------------------------
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+poetry.lock
+Pipfile.lock
+Gemfile.lock
+
+# -------------------------
+# Binaries / archives
+# -------------------------
+*.exe
+*.dll
+*.so
+*.dylib
+*.jar
+*.war
+*.ear
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.iso
+
+# -------------------------
+# Images / media / docs
+# -------------------------
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.mp3
+*.mp4
+*.mov
+*.avi
+*.pdf
+
+# -------------------------
+# Minified / compiled assets
+# -------------------------
+*.min.js
+*.min.css
+*.map
+
+# -------------------------
+# Infrastructure caches
+# -------------------------
+.terraform/
+.terragrunt-cache/
+.npm/
+.yarn/
+.cache/
+
+# -------------------------
+# Test fixtures that contain fake secrets
+# -------------------------
+test/fixtures/
+tests/fixtures/
