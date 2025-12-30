@@ -5,6 +5,8 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC (adjust as desired)
 
 permissions:
   contents: read
@@ -31,6 +33,39 @@ jobs:
           git clone --depth 1 https://github.com/americanexpress/earlybird /tmp/earlybird-src
           cd /tmp/earlybird-src
           go build -o /tmp/earlybird-bin .
+
+      # EarlyBird expects a config at ~/.go-earlybird/earlybird.json by default.
+      - name: Prepare EarlyBird config
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.go-earlybird
+          cat << 'EOF' > ~/.go-earlybird/earlybird.json
+{
+  "confidence": 0.6,
+  "confidenceThreshold": 0.6,
+  "entropy": true,
+  "entropyThreshold": 3.5,
+  "maxFileSize": 5242880,
+  "allowlist": [],
+  "exclude": []
+}
+EOF
+
+      # Optional: create a local ignore file if you don't already have one.
+      # (If you already have .ge_ignore in your repo, you can delete this step.)
+      - name: Ensure .ge_ignore exists (optional)
+        run: |
+          set -euo pipefail
+          if [ ! -f "${GITHUB_WORKSPACE}/.ge_ignore" ]; then
+            cat << 'EOF' > "${GITHUB_WORKSPACE}/.ge_ignore"
+node_modules/
+dist/
+build/
+vendor/
+*.min.js
+*.lock
+EOF
+          fi
 
       - name: Run EarlyBird scan (non-blocking)
         run: |
