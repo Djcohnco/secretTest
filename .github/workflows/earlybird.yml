@@ -1,17 +1,19 @@
 name: EarlyBird -> Ingest Endpoint (non-blocking)
 
-"on":
+on:
   pull_request: {}
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
   workflow_dispatch: {}
   schedule:
     - cron: "0 14 * * 1" # Mondays 14:00 UTC
 
 permissions:
   contents: read
+
+concurrency:
+  group: earlybird-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   earlybird:
@@ -43,13 +45,20 @@ jobs:
           cp -R /tmp/earlybird-src/config/* ~/.go-earlybird/
 
       - name: Run EarlyBird scan (non-blocking)
+        shell: bash
         run: |
           set +e
-          # If you don't have .ge_ignore in the repo yet, remove the --ignorefile flag.
-          /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" --ignorefile "${GITHUB_WORKSPACE}/.ge_ignore" 2>&1 | tee earlybird-output.txt
+          IGNORE_ARG=""
+          if [ -f "${GITHUB_WORKSPACE}/.ge_ignore" ]; then
+            IGNORE_ARG="--ignorefile ${GITHUB_WORKSPACE}/.ge_ignore"
+          fi
+
+          /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" ${IGNORE_ARG} 2>&1 | tee earlybird-output.txt
+          echo "earlybird_exit_code=$?" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Convert EarlyBird output -> ingest payload JSON (no secrets)
+        shell: bash
         run: |
           set -euo pipefail
           python3 - << 'PY'
@@ -57,9 +66,10 @@ jobs:
           from datetime import datetime, timezone
 
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
-          text = open(os.path.join(root, "earlybird-output.txt"), "r", encoding="utf-8", errors="replace").read()
+          in_path = os.path.join(root, "earlybird-output.txt")
+          text = open(in_path, "r", encoding="utf-8", errors="replace").read()
 
-          # Extract some useful scan metadata if present
+          # Metadata extraction (best-effort)
           tool_ver = None
           m = re.search(r"Go-EarlyBird version:\s*(.+)", text)
           if m:
@@ -75,20 +85,22 @@ jobs:
           if m:
               files_scanned = int(m.group(1))
 
+          # Parse findings (tolerant: allow arbitrary lines between fields)
           finding_re = re.compile(
               r"Finding\s*#\s*(?P<num>\d+):\s*\n"
-              r"\s*Code\s*#:\s*(?P<code>\d+)\s*\n"
-              r"\s*Filename:\s*(?P<file>.+?)\s*\n"
-              r"\s*Caption:\s*(?P<caption>.+?)\s*\n"
-              r"\s*Category:\s*(?P<category>.+?)\s*\n"
-              r"\s*Line\s*#:\s*(?P<line>\d+)\s*\n"
-              r"\s*Value:\s*(?P<value>.+?)\s*\n"
-              r"\s*Severity:\s*(?P<severity>\w+)\s*\n"
-              r"\s*Confidence:\s*(?P<confidence>\w+)\s*\n",
+              r"(?:(?:.|\n)*?)"
+              r"^\s*Code\s*#:\s*(?P<code>\d+)\s*$\n"
+              r"^\s*Filename:\s*(?P<file>.+?)\s*$\n"
+              r"^\s*Caption:\s*(?P<caption>.+?)\s*$\n"
+              r"^\s*Category:\s*(?P<category>.+?)\s*$\n"
+              r"^\s*Line\s*#:\s*(?P<line>\d+)\s*$\n"
+              r"^\s*Value:\s*(?P<value>.+?)\s*$\n"
+              r"^\s*Severity:\s*(?P<severity>\w+)\s*$\n"
+              r"^\s*Confidence:\s*(?P<confidence>\w+)\s*$\n",
               re.MULTILINE
           )
 
-          def rel_path(p):
+          def rel_path(p: str) -> str:
               p = p.strip()
               try:
                   if p.startswith(root):
@@ -99,7 +111,7 @@ jobs:
 
           findings = []
           for m in finding_re.finditer(text):
-              raw_val = m.group("value").strip()
+              raw_val = (m.group("value") or "").strip()
               findings.append({
                   "code": m.group("code").strip(),
                   "caption": m.group("caption").strip(),
@@ -115,10 +127,8 @@ jobs:
 
           by_sev = {"low": 0, "medium": 0, "high": 0, "critical": 0}
           for f in findings:
-              sev = f.get("severity", "low")
-              if sev not in by_sev:
-                  by_sev[sev] = 0
-              by_sev[sev] += 1
+              sev = (f.get("severity") or "low").lower()
+              by_sev[sev] = by_sev.get(sev, 0) + 1
 
           run_key = f'{os.environ.get("GITHUB_REPOSITORY")}:{os.environ.get("GITHUB_SHA")}:{os.environ.get("GITHUB_RUN_ID")}:{os.environ.get("GITHUB_RUN_ATTEMPT")}'
 
@@ -148,21 +158,23 @@ jobs:
               }
           }
 
-          out = os.path.join(root, "earlybird-payload.json")
-          with open(out, "w", encoding="utf-8") as f:
+          out_path = os.path.join(root, "earlybird-payload.json")
+          with open(out_path, "w", encoding="utf-8") as f:
               json.dump(payload, f, indent=2)
 
-          print(f"Wrote {out} with {len(findings)} finding(s). run_key={run_key}")
+          print(f"Wrote {out_path} with {len(findings)} finding(s). run_key={run_key}")
           PY
 
       - name: Send payload to ingest endpoint (non-blocking)
+        shell: bash
         env:
           INGEST_URL: ${{ secrets.EARLYBIRD_INGEST_URL }}
           INGEST_TOKEN: ${{ secrets.EARLYBIRD_INGEST_TOKEN }}
         run: |
           set +e
-          if [ -z "${INGEST_URL}" ]; then
-            echo "EARLYBIRD_INGEST_URL secret is not set; skipping POST."
+
+          if [ -z "${INGEST_URL}" ] || [ -z "${INGEST_TOKEN}" ]; then
+            echo "EARLYBIRD_INGEST_URL or EARLYBIRD_INGEST_TOKEN is not set; skipping POST."
             exit 0
           fi
 
@@ -188,10 +200,5 @@ jobs:
           echo "Ingest response (first 2KB):"
           head -c 2048 ingest-response.txt || true
 
+          # Never fail the workflow
           exit 0
-
-      - name: Upload payload artifact (optional, useful while building)
-        uses: actions/upload-artifact@v4
-        with:
-          name: earlybird-payload
-          path: earlybird-payload.json
