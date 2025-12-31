@@ -1,7 +1,7 @@
-name: EarlyBird -> GitHub Code Scanning (non-blocking)
+name: EarlyBird -> Ingest Endpoint (non-blocking)
 
 "on":
-  pull_request_target: {}
+  pull_request: {}
   push:
     branches:
       - main
@@ -12,14 +12,13 @@ name: EarlyBird -> GitHub Code Scanning (non-blocking)
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   earlybird:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo (base branch)
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -46,25 +45,38 @@ jobs:
       - name: Run EarlyBird scan (non-blocking)
         run: |
           set +e
+          # If you don't have .ge_ignore in the repo yet, remove the --ignorefile flag.
           /tmp/go-earlybird --path "${GITHUB_WORKSPACE}" --ignorefile "${GITHUB_WORKSPACE}/.ge_ignore" 2>&1 | tee earlybird-output.txt
           exit 0
 
-      - name: Convert EarlyBird output -> SARIF (no fingerprints)
+      - name: Convert EarlyBird output -> ingest payload JSON (no secrets)
         run: |
           set -euo pipefail
           python3 - << 'PY'
-          import json, os, re
+          import json, os, re, hashlib
           from datetime import datetime, timezone
 
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
-          in_path = os.path.join(root, "earlybird-output.txt")
-          out_path = os.path.join(root, "earlybird.sarif")
+          text = open(os.path.join(root, "earlybird-output.txt"), "r", encoding="utf-8", errors="replace").read()
 
-          text = open(in_path, "r", encoding="utf-8", errors="replace").read()
+          # Extract some useful scan metadata if present
+          tool_ver = None
+          m = re.search(r"Go-EarlyBird version:\s*(.+)", text)
+          if m:
+              tool_ver = m.group(1).strip()
+
+          rules_observed = None
+          m = re.search(r"(\d+)\s+rules observed", text)
+          if m:
+              rules_observed = int(m.group(1))
+
+          files_scanned = None
+          m = re.search(r"(\d+)\s+files scanned", text)
+          if m:
+              files_scanned = int(m.group(1))
 
           finding_re = re.compile(
               r"Finding\s*#\s*(?P<num>\d+):\s*\n"
-              r"(?:.*?\n)*?"
               r"\s*Code\s*#:\s*(?P<code>\d+)\s*\n"
               r"\s*Filename:\s*(?P<file>.+?)\s*\n"
               r"\s*Caption:\s*(?P<caption>.+?)\s*\n"
@@ -85,95 +97,101 @@ jobs:
                   pass
               return p
 
-          def sarif_level(sev):
-              sev = (sev or "").lower()
-              if sev in ("high", "critical"):
-                  return "error"
-              if sev == "medium":
-                  return "warning"
-              return "note"
-
-          def uniq_tags(*items):
-              seen = set()
-              out = []
-              for it in items:
-                  it = (it or "").strip()
-                  if not it:
-                      continue
-                  it = it.lower()
-                  if it not in seen:
-                      seen.add(it)
-                      out.append(it)
-              return out
-
-          rules = {}
-          results = []
-
+          findings = []
           for m in finding_re.finditer(text):
-              code = m.group("code").strip()
-              caption = m.group("caption").strip()
-              category = m.group("category").strip()
-              value = m.group("value").strip()
-              sev = m.group("severity").strip()
-              conf = m.group("confidence").strip()
-              line = int(m.group("line").strip())
-              file_abs = m.group("file").strip()
-              file_rel = rel_path(file_abs)
-
-              rule_id = f"EB-{code}"
-
-              if rule_id not in rules:
-                  rules[rule_id] = {
-                      "id": rule_id,
-                      "name": rule_id,
-                      "shortDescription": {"text": caption},
-                      "fullDescription": {"text": f"{caption} (category={category}, confidence={conf})"},
-                      "properties": {
-                          "tags": uniq_tags("earlybird", category, conf, sev),
-                          "precision": conf.lower(),
-                          "severity": sev.lower(),
-                      },
-                  }
-
-              results.append({
-                  "ruleId": rule_id,
-                  "level": sarif_level(sev),
-                  "message": {"text": f"{caption} | Value: {value}"},
-                  "locations": [{
-                      "physicalLocation": {
-                          "artifactLocation": {"uri": file_rel},
-                          "region": {"startLine": line}
-                      }
-                  }]
+              raw_val = m.group("value").strip()
+              findings.append({
+                  "code": m.group("code").strip(),
+                  "caption": m.group("caption").strip(),
+                  "category": m.group("category").strip(),
+                  "severity": m.group("severity").strip().lower(),
+                  "confidence": m.group("confidence").strip().lower(),
+                  "filename": rel_path(m.group("file")),
+                  "line": int(m.group("line").strip()),
+                  # DO NOT SEND THE VALUE. Send hash + length only.
+                  "value_hash": hashlib.sha256(raw_val.encode("utf-8")).hexdigest(),
+                  "value_len": len(raw_val),
               })
 
-          sarif = {
-              "version": "2.1.0",
-              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-              "runs": [{
-                  "tool": {
-                      "driver": {
-                          "name": "EarlyBird",
-                          "informationUri": "https://github.com/americanexpress/earlybird",
-                          "rules": list(rules.values())
-                      }
-                  },
-                  "invocations": [{
-                      "executionSuccessful": True,
-                      "endTimeUtc": datetime.now(timezone.utc).isoformat()
-                  }],
-                  "results": results
-              }]
+          by_sev = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+          for f in findings:
+              sev = f.get("severity", "low")
+              if sev not in by_sev:
+                  by_sev[sev] = 0
+              by_sev[sev] += 1
+
+          run_key = f'{os.environ.get("GITHUB_REPOSITORY")}:{os.environ.get("GITHUB_SHA")}:{os.environ.get("GITHUB_RUN_ID")}:{os.environ.get("GITHUB_RUN_ATTEMPT")}'
+
+          payload = {
+              "meta": {
+                  "run_key": run_key,
+                  "repo": os.environ.get("GITHUB_REPOSITORY"),
+                  "ref": os.environ.get("GITHUB_REF"),
+                  "sha": os.environ.get("GITHUB_SHA"),
+                  "run_id": int(os.environ.get("GITHUB_RUN_ID", "0")),
+                  "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "0")),
+                  "event": os.environ.get("GITHUB_EVENT_NAME"),
+                  "actor": os.environ.get("GITHUB_ACTOR"),
+                  "timestamp_utc": datetime.now(timezone.utc).isoformat()
+              },
+              "scan": {
+                  "tool": "earlybird",
+                  "tool_version": tool_ver,
+                  "path": root,
+                  "files_scanned": files_scanned,
+                  "rules_observed": rules_observed
+              },
+              "findings": findings,
+              "summary": {
+                  "total_findings": len(findings),
+                  "by_severity": by_sev
+              }
           }
 
-          with open(out_path, "w", encoding="utf-8") as f:
-              json.dump(sarif, f, indent=2)
+          out = os.path.join(root, "earlybird-payload.json")
+          with open(out, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
 
-          print(f"Wrote {out_path} with {len(results)} result(s).")
+          print(f"Wrote {out} with {len(findings)} finding(s). run_key={run_key}")
           PY
 
-      - name: Upload SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v4
+      - name: Send payload to ingest endpoint (non-blocking)
+        env:
+          INGEST_URL: ${{ secrets.EARLYBIRD_INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.EARLYBIRD_INGEST_TOKEN }}
+        run: |
+          set +e
+          if [ -z "${INGEST_URL}" ]; then
+            echo "EARLYBIRD_INGEST_URL secret is not set; skipping POST."
+            exit 0
+          fi
+
+          RUN_KEY=$(python3 - << 'PY'
+          import json
+          d=json.load(open("earlybird-payload.json"))
+          print(d["meta"]["run_key"])
+          PY
+          )
+
+          http_code=$(curl -sS -o ingest-response.txt -w "%{http_code}" \
+            -X POST "${INGEST_URL}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${INGEST_TOKEN}" \
+            -H "X-Idempotency-Key: ${RUN_KEY}" \
+            --connect-timeout 5 \
+            --max-time 20 \
+            --retry 2 \
+            --retry-delay 1 \
+            --data-binary @earlybird-payload.json)
+
+          echo "Ingest HTTP status: ${http_code}"
+          echo "Ingest response (first 2KB):"
+          head -c 2048 ingest-response.txt || true
+
+          exit 0
+
+      - name: Upload payload artifact (optional, useful while building)
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: earlybird.sarif
-          category: earlybird
+          name: earlybird-payload
+          path: earlybird-payload.json
